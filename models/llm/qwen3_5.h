@@ -78,6 +78,7 @@ private:
     float rope_theta_ = 0;
     float rms_eps_ = 0;
     int lin_num_heads_ = 0;
+    int lin_num_val_heads_ = 0;
     int lin_key_dim_ = 0;
     int lin_val_dim_ = 0;
     int lin_total_key_ = 0;

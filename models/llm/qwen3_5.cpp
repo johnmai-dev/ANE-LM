@@ -124,7 +124,7 @@ void Qwen35Model::reset() {
             memset(kv_caches_[L].v_cache, 0, (size_t)KV_CACHE_CAPACITY * num_kv_heads_ * head_dim_ * sizeof(float));
         }
         if (layer_types_[L] == LayerType::LinearAttention) {
-            memset(delta_states_[L].ssm_state, 0, (size_t)lin_num_heads_ * lin_key_dim_ * lin_val_dim_ * sizeof(float));
+            memset(delta_states_[L].ssm_state, 0, (size_t)lin_num_val_heads_ * lin_key_dim_ * lin_val_dim_ * sizeof(float));
             memset(delta_states_[L].conv_state, 0, (size_t)lin_qkv_dim_ * (conv_kernel_ - 1) * sizeof(float));
             delta_states_[L].conv_pos = 0;
         }
@@ -143,10 +143,11 @@ void Qwen35Model::apply_args(const Qwen35Args& args) {
     rope_theta_ = args.rope_theta;
     rms_eps_ = args.rms_norm_eps;
     lin_num_heads_ = args.linear_num_key_heads;
+    lin_num_val_heads_ = args.linear_num_value_heads;
     lin_key_dim_ = args.linear_key_head_dim;
     lin_val_dim_ = args.linear_value_head_dim;
     lin_total_key_ = lin_num_heads_ * lin_key_dim_;
-    lin_total_val_ = lin_num_heads_ * lin_val_dim_;
+    lin_total_val_ = lin_num_val_heads_ * lin_val_dim_;
     lin_qkv_dim_ = lin_total_key_ * 2 + lin_total_val_;
     conv_kernel_ = args.linear_conv_kernel_dim;
     full_q_dim_ = num_q_heads_ * head_dim_ * 2;
@@ -205,7 +206,8 @@ bool Qwen35Model::load(const std::string& model_dir) {
     scratch_conv_ = (float*)calloc(lin_qkv_dim_, sizeof(float));
     scratch_y_ = (float*)calloc(lin_total_val_, sizeof(float));
     scratch_attn_ = (float*)calloc(full_out_dim_, sizeof(float));
-    scratch_tmp_ = (float*)calloc(lin_qkv_dim_, sizeof(float));
+    // scratch_tmp_: a_vec (lin_num_val_heads_) + b_vec (lin_num_val_heads_) + silu_tmp (lin_qkv_dim_)
+    scratch_tmp_ = (float*)calloc((size_t)lin_num_val_heads_ * 2 + lin_qkv_dim_, sizeof(float));
     rope_cos_ = (float*)calloc((size_t)MAX_SEQ_LEN * (rot_dim_ / 2), sizeof(float));
     rope_sin_ = (float*)calloc((size_t)MAX_SEQ_LEN * (rot_dim_ / 2), sizeof(float));
 
@@ -244,7 +246,7 @@ bool Qwen35Model::load(const std::string& model_dir) {
         }
         if (layer_types_[L] == LayerType::LinearAttention) {
             auto& ds = delta_states_[L];
-            ds.ssm_state = (float*)calloc((size_t)lin_num_heads_ * lin_key_dim_ * lin_val_dim_, sizeof(float));
+            ds.ssm_state = (float*)calloc((size_t)lin_num_val_heads_ * lin_key_dim_ * lin_val_dim_, sizeof(float));
             ds.conv_state = (float*)calloc((size_t)lin_qkv_dim_ * (conv_kernel_ - 1), sizeof(float));
             ds.conv_pos = 0;
         }
@@ -290,23 +292,24 @@ bool Qwen35Model::load_weights(ModelWeights* sf) {
         if (lw.type == LayerType::LinearAttention) {
             auto& dw = lw.deltanet;
 
+            // Note: in_proj_a/b, A_log, dt_bias use linear_num_value_heads (not key_heads)
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_a.weight", L);
-            dw.in_proj_a = sf->load_bf16_to_f32(name, (int64_t)lin_num_heads_ * hidden_size_);
+            dw.in_proj_a = sf->load_bf16_to_f32(name, (int64_t)lin_num_val_heads_ * hidden_size_);
 
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.in_proj_b.weight", L);
-            dw.in_proj_b = sf->load_bf16_to_f32(name, (int64_t)lin_num_heads_ * hidden_size_);
+            dw.in_proj_b = sf->load_bf16_to_f32(name, (int64_t)lin_num_val_heads_ * hidden_size_);
 
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.conv1d.weight", L);
             dw.conv1d_w = sf->load_bf16_to_f32(name, (int64_t)lin_qkv_dim_ * conv_kernel_);
 
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.A_log", L);
-            dw.A = sf->load_f32_direct(name, lin_num_heads_);
+            dw.A = sf->load_f32_direct(name, lin_num_val_heads_);
             if (dw.A) {
-                for (int i = 0; i < lin_num_heads_; i++) dw.A[i] = expf(dw.A[i]);
+                for (int i = 0; i < lin_num_val_heads_; i++) dw.A[i] = expf(dw.A[i]);
             }
 
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.dt_bias", L);
-            dw.dt_bias = sf->load_bf16_to_f32(name, lin_num_heads_);
+            dw.dt_bias = sf->load_bf16_to_f32(name, lin_num_val_heads_);
 
             snprintf(name, sizeof(name), "model.language_model.layers.%d.linear_attn.norm.weight", L);
             dw.norm_w = sf->load_f32_direct(name, lin_val_dim_);
@@ -522,43 +525,54 @@ bool Qwen35Model::forward_deltanet_core(int L, float* x, float* pre_oproj) {
     float* z = qkv_z + lin_qkv_dim_;
 
     // Small projections on CPU
-    float a_vec[lin_num_heads_];
-    float b_vec[lin_num_heads_];
-    matvec(a_vec, dw.in_proj_a, x, lin_num_heads_, hidden_size_);
-    matvec(b_vec, dw.in_proj_b, x, lin_num_heads_, hidden_size_);
+    // Note: in_proj_a/b output dim is lin_num_val_heads_
+    float* a_vec = scratch_tmp_;
+    float* b_vec = scratch_tmp_ + lin_num_val_heads_;
+    matvec(a_vec, dw.in_proj_a, x, lin_num_val_heads_, hidden_size_);
+    matvec(b_vec, dw.in_proj_b, x, lin_num_val_heads_, hidden_size_);
 
     // Causal conv1d + SiLU
     float* conv_out = scratch_conv_;
     conv1d_update(conv_out, st.conv_state, &st.conv_pos, mixed_qkv, dw.conv1d_w, lin_qkv_dim_, conv_kernel_);
-    silu_vec_inplace(conv_out, lin_qkv_dim_, scratch_tmp_);
+    silu_vec_inplace(conv_out, lin_qkv_dim_, scratch_tmp_ + lin_num_val_heads_ * 2);
 
     // Split into Q, K, V
+    // Q and K have lin_num_heads_ heads, V has lin_num_val_heads_ heads
+    // Each key head corresponds to (lin_num_val_heads_ / lin_num_heads_) value heads
     float* Q = conv_out;
     float* K = conv_out + lin_total_key_;
     float* V = conv_out + lin_total_key_ * 2;
 
     // Per-head SSM
+    // Architecture: 16 key heads, 32 value heads
+    // Each key head pairs with 2 value heads (val_heads_per_key = 2)
     float* y = scratch_y_;
     float q_scale = 1.0f / sqrtf((float)lin_key_dim_);
-    for (int h = 0; h < lin_num_heads_; h++) {
-        float* qh = Q + h * lin_key_dim_;
-        float* kh = K + h * lin_key_dim_;
-        float* vh = V + h * lin_val_dim_;
-        float* yh = y + h * lin_val_dim_;
-        float* state = st.ssm_state + h * lin_key_dim_ * lin_val_dim_;
+    int val_heads_per_key = lin_num_val_heads_ / lin_num_heads_;
+
+    for (int kh = 0; kh < lin_num_heads_; kh++) {
+        float* qh = Q + kh * lin_key_dim_;
+        float* kh_ptr = K + kh * lin_key_dim_;
 
         l2_normalize(qh, lin_key_dim_);
-        l2_normalize(kh, lin_key_dim_);
+        l2_normalize(kh_ptr, lin_key_dim_);
         float qs = q_scale;
         vDSP_vsmul(qh, 1, &qs, qh, 1, (vDSP_Length)lin_key_dim_);
 
-        float beta = sigmoid_f(b_vec[h]);
-        float decay = expf(-dw.A[h] * softplus_f(a_vec[h] + dw.dt_bias[h]));
-        ssm_step(yh, state, qh, kh, vh, decay, beta, lin_key_dim_, lin_val_dim_);
+        for (int vsub = 0; vsub < val_heads_per_key; vsub++) {
+            int vh = kh * val_heads_per_key + vsub;
+            float* vh_ptr = V + vh * lin_val_dim_;
+            float* yh = y + vh * lin_val_dim_;
+            float* state = st.ssm_state + vh * lin_key_dim_ * lin_val_dim_;
+
+            float beta = sigmoid_f(b_vec[vh]);
+            float decay = expf(-dw.A[vh] * softplus_f(a_vec[vh] + dw.dt_bias[vh]));
+            ssm_step(yh, state, qh, kh_ptr, vh_ptr, decay, beta, lin_key_dim_, lin_val_dim_);
+        }
     }
 
     // RMSNorm gated
-    for (int h = 0; h < lin_num_heads_; h++) {
+    for (int h = 0; h < lin_num_val_heads_; h++) {
         rmsnorm_gated(pre_oproj + h * lin_val_dim_,
                       y + h * lin_val_dim_,
                       z + h * lin_val_dim_,

@@ -9,7 +9,7 @@
 #include <ane_lm/common.h>
 #include "utils.h"
 #include "generate.h"
-#include "core/safetensors.h"
+#include "core/model_loader.h"
 
 // ObjC autorelease pool via C runtime API
 extern "C" void* objc_autoreleasePoolPush(void);
@@ -169,24 +169,18 @@ static int cmd_chat(LLMModel& model, Tokenizer& tokenizer, const Args& args) {
 static int cmd_convert(const Args& args) {
     std::string model_dir = args.model_dir;
 
-    // Find safetensors file (same logic as qwen3_5.cpp)
-    std::string sf_path = model_dir + "/model.safetensors-00001-of-00001.safetensors";
-    SafeTensors* sf = SafeTensors::open(sf_path);
-    if (!sf) {
-        sf_path = model_dir + "/model.safetensors";
-        sf = SafeTensors::open(sf_path);
-    }
-    if (!sf) {
-        fprintf(stderr, "Error: no safetensors file found in %s\n", model_dir.c_str());
+    // Discover all safetensors files (single-file or sharded) and convert them.
+    auto weights = ModelWeights::open(model_dir);
+    if (!weights) {
+        fprintf(stderr, "Error: failed to load model weights in %s\n", model_dir.c_str());
         return 1;
     }
 
     std::string output_dir = model_dir + "/ane_weights";
 
     Timer timer;
-    int written = SafeTensors::write_ane_blobs(*sf, output_dir);
+    int written = weights->write_ane_blobs(output_dir);
     double elapsed = timer.elapsed_ms();
-    delete sf;
 
     if (written < 0) {
         fprintf(stderr, "Error: conversion failed\n");

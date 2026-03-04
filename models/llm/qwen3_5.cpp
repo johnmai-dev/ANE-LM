@@ -168,15 +168,10 @@ bool Qwen35Model::load(const std::string& model_dir) {
     Qwen35Args args = Qwen35Args::from_json(j);
     apply_args(args);
 
-    // 2. Open safetensors (try multi-shard then single-file)
-    std::string sf_path = model_dir + "/model.safetensors-00001-of-00001.safetensors";
-    SafeTensors* sf = SafeTensors::open(sf_path);
+    // 2. Open model weights (single-file or sharded)
+    auto sf = ModelWeights::open(model_dir);
     if (!sf) {
-        sf_path = model_dir + "/model.safetensors";
-        sf = SafeTensors::open(sf_path);
-    }
-    if (!sf) {
-        fprintf(stderr, "Failed to open safetensors in %s\n", model_dir.c_str());
+        fprintf(stderr, "Failed to open model weights in %s\n", model_dir.c_str());
         return false;
     }
 
@@ -184,13 +179,11 @@ bool Qwen35Model::load(const std::string& model_dir) {
     const SFTensor* embed = sf->find("model.language_model.embed_tokens.weight");
     if (!embed || embed->ndims != 2) {
         fprintf(stderr, "Cannot infer dims: missing or invalid embed_tokens.weight\n");
-        delete sf;
         return false;
     }
     const SFTensor* gate = sf->find("model.language_model.layers.0.mlp.gate_proj.weight");
     if (!gate || gate->ndims != 2) {
         fprintf(stderr, "Cannot infer dims: missing or invalid gate_proj.weight\n");
-        delete sf;
         return false;
     }
 
@@ -258,7 +251,7 @@ bool Qwen35Model::load(const std::string& model_dir) {
     }
 
     // 4. Load weights + compile ANE kernels
-    if (!load_weights(sf)) { delete sf; return false; }
+    if (!load_weights(sf.get())) { return false; }
     // Detect pre-converted ANE blob directory
     std::string blob_dir = model_dir + "/ane_weights";
     struct stat st_blob;
@@ -267,13 +260,12 @@ bool Qwen35Model::load(const std::string& model_dir) {
         LOG("Using pre-converted ANE blobs from %s\n", blob_dir.c_str());
     }
 
-    if (!compile_ane(sf, has_blobs ? blob_dir : "")) { delete sf; return false; }
+    if (!compile_ane(sf.get(), has_blobs ? blob_dir : "")) { return false; }
 
-    delete sf;
     return true;
 }
 
-bool Qwen35Model::load_weights(SafeTensors* sf) {
+bool Qwen35Model::load_weights(ModelWeights* sf) {
     char name[256];
 
     embed_tokens_ = sf->load_bf16_to_f32("model.language_model.embed_tokens.weight",
@@ -354,7 +346,7 @@ static std::string blob_path(const std::string& dir, const char* tensor_name) {
     return p;
 }
 
-bool Qwen35Model::compile_ane(SafeTensors* sf, const std::string& blob_dir) {
+bool Qwen35Model::compile_ane(ModelWeights* sf, const std::string& blob_dir) {
     if (!ane_available()) {
         fprintf(stderr, "ANE not available, cannot run\n");
         return false;
@@ -458,7 +450,7 @@ bool Qwen35Model::compile_ane(SafeTensors* sf, const std::string& blob_dir) {
     return true;
 }
 
-bool Qwen35Model::compile_lm_head_ane(SafeTensors* sf, const std::string& blob_dir) {
+bool Qwen35Model::compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir) {
     bool use_blobs = !blob_dir.empty();
 
     // For blob mode, we need the embed blob; for bf16 mode, the bf16 pointer

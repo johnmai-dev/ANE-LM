@@ -28,6 +28,8 @@ std::pair<std::unique_ptr<LLMModel>, Tokenizer> load(
     std::unique_ptr<LLMModel> model;
     if (model_type == "qwen3_5") {
         model = std::make_unique<Qwen35Model>();
+    } else if (model_type == "qwen3") {
+        model = std::make_unique<Qwen3Model>();
     } else {
         throw std::runtime_error("Unsupported model_type: " + model_type);
     }

@@ -3,6 +3,7 @@
 LLM inference on Apple Neural Engine (ANE) using private `AppleNeuralEngine.framework` APIs. 
 ## Supported Models
 
+- Qwen3 (dense)
 - Qwen3.5 (dense, text-only)
 
 ## Build
@@ -16,7 +17,7 @@ cmake --build build
 
 ![image](assets/image.png)
 
-Download a supported model (e.g. `Qwen3.5-0.8B` in safetensors format), then:
+Download a supported model (e.g. `Qwen3-0.6B` or `Qwen3.5-0.8B` in safetensors format), then:
 
 ```bash
 # Single-shot generation

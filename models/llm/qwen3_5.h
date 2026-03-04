@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../core/safetensors.h"
+#include "../../core/model_loader.h"
 #include "../../core/ane_runtime.h"
 #include <nlohmann/json.hpp>
 #include <memory>
@@ -163,9 +163,9 @@ private:
     float* rope_sin_ = nullptr;
 
     void apply_args(const Qwen35Args& args);
-    bool load_weights(SafeTensors* sf);
-    bool compile_ane(SafeTensors* sf, const std::string& blob_dir);
-    bool compile_lm_head_ane(SafeTensors* sf, const std::string& blob_dir);
+    bool load_weights(ModelWeights* sf);
+    bool compile_ane(ModelWeights* sf, const std::string& blob_dir);
+    bool compile_lm_head_ane(ModelWeights* sf, const std::string& blob_dir);
     void free_lm_head_ane();
 
     bool forward_deltanet_core(int L, float* x, float* pre_oproj);

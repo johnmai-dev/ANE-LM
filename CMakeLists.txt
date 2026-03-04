@@ -44,6 +44,7 @@ set(VENDOR_SOURCES
 set(CORE_SOURCES
     common.cpp
     core/safetensors.cpp
+    core/model_loader.cpp
     core/tokenizer.cpp
     core/cpu_ops.cpp
     core/sampling.cpp
@@ -54,6 +55,7 @@ set(CORE_SOURCES
 
 set(MODEL_SOURCES
     models/llm/qwen3_5.cpp
+    models/llm/qwen3.cpp
 )
 
 set(MAIN_SOURCE
